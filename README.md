@@ -25,6 +25,33 @@ Backs up an Android phone via USB (ADB) to a local archive. Preserves images, do
    - Settings → Developer options → enable "USB debugging"
    - Connect via USB and authorize the computer when prompted
 
+3. **Ubuntu: Fix USB permissions** (if you see "insufficient permissions for device: missing udev rules"):
+
+   Find your device's USB IDs (with phone connected):
+   ```bash
+   lsusb
+   ```
+   Look for your phone (e.g. `ID 18d1:4ee9 Google Inc. Nexus/Pixel Device`). Note the vendor ID (e.g. `18d1`) and product ID (e.g. `4ee9`).
+
+   Add a udev rule:
+   ```bash
+   echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", ATTR{idProduct}=="4ee9", MODE="0666", GROUP="plugdev"' | sudo tee /etc/udev/rules.d/51-android.rules
+   ```
+
+   Apply and reconnect:
+   ```bash
+   sudo udevadm control --reload-rules
+   sudo udevadm trigger
+   ```
+   Unplug and reconnect the phone, then:
+   ```bash
+   adb kill-server
+   adb start-server
+   adb devices
+   ```
+
+   Replace `18d1` and `4ee9` with your device's vendor and product IDs from `lsusb`. Ensure your user is in the `plugdev` group: `groups` (if not: `sudo usermod -aG plugdev $USER`, then log out and back in).
+
 ## Usage
 
 ```bash
