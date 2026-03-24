@@ -6,8 +6,9 @@ __pycache__/
 venv/
 .env
 
-# IDE
+# IDE (keep machine- and org-specific settings local)
 .idea/
+.vscode/
 *.swp
 *.swo
 
