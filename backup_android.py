@@ -6,7 +6,9 @@ files even after they are removed from the phone. Excludes Dropbox.
 """
 
 import argparse
+from datetime import datetime
 import logging
+import re
 import shutil
 import subprocess
 import sys
@@ -84,6 +86,44 @@ def get_storage_root() -> str:
     result = run_adb(["shell", "echo $EXTERNAL_STORAGE"], check=False)
     root = (result.stdout or "").strip()
     return root or DEFAULT_STORAGE_ROOT
+
+
+def get_device_serial() -> str:
+    """Return the connected device serial or a fallback label."""
+    result = run_adb(["devices"], check=True)
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    for line in lines[1:]:
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == "device":
+            return parts[0]
+    return "unknown-device"
+
+
+def sanitize_phone_name(value: str) -> str:
+    """Convert a string to a filesystem-safe slug."""
+    cleaned = re.sub(r"[^a-zA-Z0-9]+", "-", value.strip().lower()).strip("-")
+    return cleaned or "android-phone"
+
+
+def get_phone_name() -> str:
+    """Build a unique phone name from manufacturer, model, and serial."""
+    manufacturer_result = run_adb(["shell", "getprop", "ro.product.manufacturer"], check=False)
+    model_result = run_adb(["shell", "getprop", "ro.product.model"], check=False)
+    manufacturer = (manufacturer_result.stdout or "").strip()
+    model = (model_result.stdout or "").strip()
+    serial = get_device_serial()
+
+    base_name = "-".join(part for part in [manufacturer, model] if part)
+    if not base_name:
+        base_name = "android-phone"
+    unique_name = f"{base_name}-{serial}"
+    return sanitize_phone_name(unique_name)
+
+
+def build_archive_path(archive_base: Path, phone_name: str) -> Path:
+    """Return dated archive path: <base>/<phone-name>/YYYYMMDD."""
+    run_date = datetime.now().strftime("%Y%m%d")
+    return archive_base / phone_name / run_date
 
 
 # -----------------------------------------------------------------------------
@@ -247,7 +287,7 @@ def parse_args() -> argparse.Namespace:
         "-o", "--output",
         type=Path,
         default=DEFAULT_ARCHIVE_ROOT,
-        help="Archive root directory",
+        help="Archive base directory",
     )
     parser.add_argument(
         "-n", "--dry-run",
@@ -309,8 +349,11 @@ def main() -> int:
     add_only = args.add_only and not args.overwrite
     try:
         storage_root = get_storage_root()
+        phone_name = get_phone_name()
+        archive_path = build_archive_path(args.output, phone_name)
+        log.info("Phone name: %s", phone_name)
         return backup(
-            archive_root=args.output,
+            archive_root=archive_path,
             storage_root=storage_root,
             log=log,
             dry_run=args.dry_run,

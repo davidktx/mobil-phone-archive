@@ -55,10 +55,10 @@ Backs up an Android phone via USB (ADB) to a local archive. Preserves images, do
 ## Usage
 
 ```bash
-# Default: backup to ~/phone-archive (add-only, no overwrite)
+# Default: backup to ~/phone-archive/<phone-name>/YYYYMMDD
 python backup_android.py
 
-# Custom output directory
+# Custom base output directory
 python backup_android.py -o /path/to/archive
 
 # Dry run (show what would be done)
@@ -76,14 +76,16 @@ python backup_android.py -v
 
 ## Archive Layout
 
-```
+```text
 ~/phone-archive/
-├── DCIM/          # Camera photos and videos
-├── Pictures/      # Screenshots, saved images
-├── Download/      # Downloaded files
-├── Movies/        # Video files
-├── Documents/     # Saved documents, PDFs
-└── Recordings/    # Voice memos, audio recordings
+└── samsung-sm-s918u-r5ct123456x/
+    └── 20260406/
+        ├── DCIM/          # Camera photos and videos
+        ├── Pictures/      # Screenshots, saved images
+        ├── Download/      # Downloaded files
+        ├── Movies/        # Video files
+        ├── Documents/     # Saved documents, PDFs
+        └── Recordings/    # Voice memos, audio recordings
 ```
 
 ## Suggestions
