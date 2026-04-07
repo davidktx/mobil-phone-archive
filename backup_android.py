@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Backup Android phone via USB (ADB) to a local archive.
 
-Archives images, downloads, and media. Never deletes from backup—preserves
-files even after they are removed from the phone. Excludes Dropbox.
+Archives images, downloads, media, and contacts (vCard via content query).
+Never deletes from backup—preserves files even after they are removed from
+the phone. Excludes Dropbox.
 """
 
 import argparse
+from collections import defaultdict
 from datetime import datetime
 import logging
 import re
@@ -39,6 +41,18 @@ BACKUP_PATHS = [
 
 # Paths containing these substrings are excluded (case-insensitive)
 EXCLUDE_SUBSTRINGS = ["dropbox", ".dropbox"]
+
+# Contacts (via adb shell content query — no root). Stored under archive root.
+CONTACTS_SUBDIR = "ContactsBackup"
+CONTACTS_VCF_NAME = "contacts.vcf"
+CONTACTS_DATA_URI = "content://com.android.contacts/data"
+# Colon-separated column list (Android `content query` syntax).
+CONTACTS_PROJECTION = (
+    "contact_id:mimetype:data1:data2:data3:display_name"
+)
+MIMETYPE_NAME = "vnd.android.cursor.item/name"
+MIMETYPE_PHONE = "vnd.android.cursor.item/phone_v2"
+MIMETYPE_EMAIL = "vnd.android.cursor.item/email_v2"
 
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
 
@@ -124,6 +138,213 @@ def build_archive_path(archive_base: Path, phone_name: str) -> Path:
     """Return dated archive path: <base>/<phone-name>/YYYYMMDD."""
     run_date = datetime.now().strftime("%Y%m%d")
     return archive_base / phone_name / run_date
+
+
+def parse_content_query_row(line: str) -> dict[str, str] | None:
+    """Parse one line from `adb shell content query` output."""
+    line = line.strip()
+    if not line.startswith("Row:"):
+        return None
+    parts = line.split(None, 2)
+    if len(parts) < 3:
+        return None
+    payload = parts[2]
+    segments = re.split(r", (?=[a-z_][a-z0-9_]*=)", payload)
+    out: dict[str, str] = {}
+    for seg in segments:
+        if "=" not in seg:
+            continue
+        key, _, val = seg.partition("=")
+        key = key.strip()
+        out[key] = val.strip()
+    return out if out else None
+
+
+def vcard_escape(value: str) -> str:
+    """Escape special characters for vCard 3.0 property values."""
+    return (
+        value.replace("\\", "\\\\")
+        .replace("\n", "\\n")
+        .replace(",", "\\,")
+        .replace(";", "\\;")
+    )
+
+
+def phone_type_label(data2: str) -> str:
+    """Map ContactsContract phone type (data2) to a vCard TYPE token."""
+    mapping = {
+        "1": "HOME",
+        "2": "MOBILE",
+        "3": "WORK",
+        "4": "WORK_FAX",
+        "5": "HOME_FAX",
+        "6": "PAGER",
+        "7": "OTHER",
+        "8": "CALLBACK",
+        "9": "CAR",
+        "10": "COMPANY_MAIN",
+        "11": "ISDN",
+        "12": "MAIN",
+        "13": "OTHER_FAX",
+        "14": "RADIO",
+        "15": "TELEX",
+        "16": "TTY_TDD",
+        "17": "WORK_MOBILE",
+        "18": "WORK_PAGER",
+        "19": "ASSISTANT",
+        "20": "MMS",
+    }
+    return mapping.get(data2.strip(), "VOICE")
+
+
+def rows_to_vcard(rows: list[dict[str, str]]) -> str:
+    """Build a vCard 3.0 document from content query rows."""
+    by_contact: dict[str, dict[str, list | str | None]] = defaultdict(
+        lambda: {
+            "names": [],
+            "phones": [],
+            "emails": [],
+            "display_name": None,
+        }
+    )
+    for row in rows:
+        cid = row.get("contact_id", "").strip()
+        mime = row.get("mimetype", "").strip()
+        if not cid or not mime:
+            continue
+        bucket = by_contact[cid]
+        dn = row.get("display_name")
+        if dn and dn != "NULL":
+            bucket["display_name"] = dn
+        data1 = row.get("data1") or ""
+        if data1 == "NULL":
+            data1 = ""
+        data2 = row.get("data2") or ""
+        if data2 == "NULL":
+            data2 = ""
+        data3 = row.get("data3") or ""
+        if data3 == "NULL":
+            data3 = ""
+        if mime == MIMETYPE_NAME:
+            bucket["names"].append((data1, data2, data3))
+        elif mime == MIMETYPE_PHONE:
+            if data1:
+                bucket["phones"].append((data1, data2))
+        elif mime == MIMETYPE_EMAIL:
+            if data1:
+                bucket["emails"].append(data1)
+
+    lines: list[str] = []
+    for cid in sorted(by_contact.keys(), key=lambda x: int(x) if x.isdigit() else 0):
+        data = by_contact[cid]
+        names: list = data["names"]
+        phones = data["phones"]
+        emails = data["emails"]
+        display_name = data["display_name"]
+        given, family = "", ""
+        fn = ""
+        if display_name and display_name != "NULL":
+            fn = display_name.strip()
+        if names:
+            full, given, family = names[0]
+            if not fn:
+                fn = (full or "").strip() or " ".join(
+                    p for p in (given, family) if p
+                ).strip()
+        if not fn and not phones and not emails:
+            continue
+        if not fn:
+            fn = "Unknown"
+        if names:
+            _full, given, family = names[0]
+            n_field = ";".join(
+                vcard_escape(x) for x in (family, given, "", "", "")
+            )
+        else:
+            n_field = ";;;;"
+        lines.append("BEGIN:VCARD")
+        lines.append("VERSION:3.0")
+        lines.append(f"FN:{vcard_escape(fn)}")
+        lines.append(f"N:{n_field}")
+        lines.append(f"X-ANDROID-CONTACT-ID:{vcard_escape(cid)}")
+        for number, ptype in phones:
+            label = phone_type_label(ptype)
+            lines.append(f"TEL;TYPE={label}:{vcard_escape(number)}")
+        for email in sorted(set(emails)):
+            lines.append(f"EMAIL;TYPE=INTERNET:{vcard_escape(email)}")
+        lines.append("END:VCARD")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def query_contact_rows(log: logging.Logger) -> tuple[list[dict[str, str]], bool]:
+    """Fetch contact rows via adb content query. Returns (rows, query_ok)."""
+    result = run_adb(
+        [
+            "shell",
+            "content",
+            "query",
+            "--uri",
+            CONTACTS_DATA_URI,
+            "--projection",
+            CONTACTS_PROJECTION,
+        ],
+        check=False,
+        capture=True,
+    )
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or "").strip()
+        log.error("Contacts query failed (adb content query): %s", err or "unknown error")
+        return [], False
+    text = result.stdout or ""
+    if "Error while accessing provider" in text:
+        log.error("Contacts provider error: %s", text[:500])
+        return [], False
+    rows: list[dict[str, str]] = []
+    for line in text.splitlines():
+        parsed = parse_content_query_row(line)
+        if parsed:
+            rows.append(parsed)
+    return rows, True
+
+
+def backup_contacts(
+    archive_root: Path,
+    log: logging.Logger,
+    dry_run: bool = False,
+    add_only: bool = False,
+) -> tuple[bool, bool]:
+    """Export contacts to ContactsBackup/contacts.vcf. Returns (success, had_error)."""
+    out_dir = archive_root / CONTACTS_SUBDIR
+    out_file = out_dir / CONTACTS_VCF_NAME
+    label = "[contacts]"
+
+    if dry_run:
+        log.info("%s Would export contacts to %s", label, out_file)
+        return True, False
+
+    if add_only and out_file.exists():
+        log.info("%s Skip existing %s (add-only)", label, out_file)
+        return True, False
+
+    log.info("%s Querying device contacts...", label)
+    rows, ok = query_contact_rows(log)
+    if not ok:
+        return False, True
+    if not rows:
+        log.warning("%s No contact rows returned; writing empty placeholder", label)
+        vcf = (
+            "# No contacts exported (empty or none visible to the contacts "
+            "provider).\n"
+        )
+    else:
+        vcf = rows_to_vcard(rows)
+        log.info("%s Parsed %d data rows, building vCard", label, len(rows))
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_file.write_text(vcf, encoding="utf-8")
+    log.info("%s Wrote %s", label, out_file)
+    return True, False
 
 
 # -----------------------------------------------------------------------------
@@ -223,6 +444,7 @@ def backup(
     log: logging.Logger,
     dry_run: bool = False,
     add_only: bool = False,
+    backup_contacts_enabled: bool = True,
 ) -> int:
     """Run backup. Returns 0 on success, non-zero on failure."""
     if not device_connected():
@@ -234,6 +456,17 @@ def backup(
 
     ok_count = 0
     total_errors = 0
+
+    if backup_contacts_enabled:
+        _c_ok, c_err = backup_contacts(
+            archive_root,
+            log,
+            dry_run=dry_run,
+            add_only=add_only,
+        )
+        if c_err:
+            total_errors += 1
+
     paths_to_backup = [p for p in BACKUP_PATHS if not should_exclude(f"{storage_root}/{p}")]
     total_dirs = len(paths_to_backup)
     current = 0
@@ -316,6 +549,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Overwrite existing files in archive",
     )
+    parser.add_argument(
+        "--skip-contacts",
+        action="store_true",
+        help="Do not export contacts to ContactsBackup/contacts.vcf",
+    )
     return parser.parse_args()
 
 
@@ -358,6 +596,7 @@ def main() -> int:
             log=log,
             dry_run=args.dry_run,
             add_only=add_only,
+            backup_contacts_enabled=not args.skip_contacts,
         )
     except FileNotFoundError as e:
         log.error("%s", e)
